@@ -212,45 +212,79 @@ This function manages the process pool to prevent resource exhaustion.
               (sleep-for (expt 2 retries))))))  ; 指数退避
        (or result (list 'error "最大重试次数已达到")))))
 
+;;; ===== Helper Functions / 辅助函数 =====
+
+(defun elilog-async--ensure-directory-exists (file-path)
+  "Ensure that the directory for FILE-PATH exists, creating it if necessary.
+确保 FILE-PATH 的目录存在，如果不存在则创建。"
+  (let ((dir (file-name-directory file-path)))
+    (when (and dir (not (file-exists-p dir)))
+      (condition-case err
+          (progn
+            (make-directory dir t)
+            (message "Elilog Async: Created directory %s" dir))
+        (error
+         (message "Elilog Async: Failed to create directory %s: %s" dir (error-message-string err))
+         (signal (car err) (cdr err)))))))
+
 ;;; ===== 异步文件写入 =====
 
 (defun elilog-async--write-to-file (formatted file-path &optional encoding)
-  "异步写入单个格式化的日志到文件。"
+  "Write formatted log to file asynchronously, ensuring directory exists.
+异步写入格式化的日志到文件，确保目录存在。"
+  ;; Ensure directory exists before any write operation / 在任何写入操作前确保目录存在
+  (elilog-async--ensure-directory-exists file-path)
+  
   (if (not (elilog-async--available-p))
       ;; 降级为同步写入
-      (progn
-        (let ((coding-system-for-write (or encoding 'utf-8)))
-          (with-temp-buffer
-            (insert formatted "\n")
-            (append-to-file (point-min) (point-max) file-path)))
-        'sync-success)
+      (condition-case err
+          (progn
+            (let ((coding-system-for-write (or encoding 'utf-8)))
+              (with-temp-buffer
+                (insert formatted "\n")
+                (append-to-file (point-min) (point-max) file-path)))
+            'sync-success)
+        (error
+         (message "Elilog Async: Sync write failed to %s: %s" file-path (error-message-string err))
+         nil))
     ;; 异步写入
     (elilog-async--with-process-limit
      (elilog-async--with-retry
       `(lambda ()
-         (let ((coding-system-for-write ',(or encoding 'utf-8)))
-           (with-temp-buffer
-             (insert ,formatted "\n")
-             (append-to-file (point-min) (point-max) ,file-path))
-           'async-success))
+         (condition-case err
+             (let ((coding-system-for-write ',(or encoding 'utf-8)))
+               (with-temp-buffer
+                 (insert ,formatted "\n")
+                 (append-to-file (point-min) (point-max) ,file-path))
+               'async-success)
+           (error
+            (message "Elilog Async: Write failed to %s: %s" ,file-path (error-message-string err))
+            nil)))
       elilog-async-retry-attempts)
      nil)))
 
 (defun elilog-async--batch-write-to-file (events file-path formatter &optional encoding)
-  "批量异步写入多个事件到文件。"
+  "Batch write multiple events to file asynchronously, ensuring directory exists.
+批量异步写入多个事件到文件，确保目录存在。"
   (when events
+    ;; Ensure directory exists before any write operation / 在任何写入操作前确保目录存在
+    (elilog-async--ensure-directory-exists file-path)
+    
     (if (not (elilog-async--available-p))
         ;; 降级为同步批量写入
-        (let ((coding-system-for-write (or encoding 'utf-8))
-              (content ""))
-          (dolist (event events)
-            (let ((formatted (elilog-formatters-format-event event formatter)))
-              (when formatted
-                (setq content (concat content formatted "\n")))))
-          (when (> (length content) 0)
-            (with-temp-buffer
-              (insert content)
-              (append-to-file (point-min) (point-max) file-path))))
+        (condition-case err
+            (let ((coding-system-for-write (or encoding 'utf-8))
+                  (content ""))
+              (dolist (event events)
+                (let ((formatted (elilog-formatters-format-event event formatter)))
+                  (when formatted
+                    (setq content (concat content formatted "\n")))))
+              (when (> (length content) 0)
+                (with-temp-buffer
+                  (insert content)
+                  (append-to-file (point-min) (point-max) file-path))))
+          (error
+           (message "Elilog Async: Batch sync write failed to %s: %s" file-path (error-message-string err))))
       ;; 异步批量写入
       (elilog-async--with-process-limit
        (elilog-async--with-retry
@@ -348,18 +382,24 @@ This function manages the process pool to prevent resource exhaustion.
 ;;; ===== 异步Sink实现 =====
 
 (defun elilog-async--sink-write-to-file (event sink)
-  "异步文件Sink写入函数。"
+  "Async file sink write function with directory creation.
+异步文件Sink写入函数，包含目录创建。"
   (let ((formatted (elilog-formatters-format-event event (elilog-sink-formatter sink)))
         (file-path (plist-get (elilog-sink-config sink) :file-path))
         (encoding (plist-get (elilog-sink-config sink) :encoding)))
     (when formatted
       (if (elilog-async--should-use-async-p event)
           (elilog-async--write-to-file formatted file-path encoding)
-        ;; 短消息使用同步写入
-        (let ((coding-system-for-write (or encoding 'utf-8)))
-          (with-temp-buffer
-            (insert formatted "\n")
-            (append-to-file (point-min) (point-max) file-path)))))))
+        ;; 短消息使用同步写入，但仍需确保目录存在
+        (condition-case err
+            (progn
+              (elilog-async--ensure-directory-exists file-path)
+              (let ((coding-system-for-write (or encoding 'utf-8)))
+                (with-temp-buffer
+                  (insert formatted "\n")
+                  (append-to-file (point-min) (point-max) file-path))))
+          (error
+           (message "Elilog Async: Sink write failed to %s: %s" file-path (error-message-string err))))))))
 
 (defun elilog-async--sink-batch-write-to-file (event sink)
   "批量异步文件Sink写入函数。"

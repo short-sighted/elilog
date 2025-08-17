@@ -82,21 +82,40 @@ Returns an elilog-sink structure for console output.
    :formatter (or formatter (elilog-formatters-create-text))
    :write-fn 'elilog-sinks--write-to-console))
 
+;;; ===== 辅助函数 =====
+
+(defun elilog-sinks--ensure-directory-exists (file-path)
+  "Ensure that the directory for FILE-PATH exists, creating it if necessary.
+确保 FILE-PATH 的目录存在，如果不存在则创建。"
+  (let ((dir (file-name-directory file-path)))
+    (when (and dir (not (file-exists-p dir)))
+      (condition-case err
+          (progn
+            (make-directory dir t)
+            (message "Elilog: Created directory %s" dir))
+        (error
+         (message "Elilog: Failed to create directory %s: %s" dir (error-message-string err))
+         (signal (car err) (cdr err)))))))
+
 ;;; ===== 文件Sink =====
 
 (defun elilog-sinks--write-to-file (event sink)
-  "写入到文件。"
+  "Write log event to file, ensuring directory exists.
+写入日志事件到文件，确保目录存在。"
   (let ((formatted (elilog-formatters-format-event event (elilog-sink-formatter sink)))
         (file-path (plist-get (elilog-sink-config sink) :file-path))
         (encoding (plist-get (elilog-sink-config sink) :encoding)))
     (when formatted
       (condition-case err
-          (let ((coding-system-for-write (or encoding 'utf-8)))
-            (with-temp-buffer
-              (insert formatted "\n")
-              (append-to-file (point-min) (point-max) file-path)))
+          (progn
+            ;; Ensure directory exists before writing / 写入前确保目录存在
+            (elilog-sinks--ensure-directory-exists file-path)
+            (let ((coding-system-for-write (or encoding 'utf-8)))
+              (with-temp-buffer
+                (insert formatted "\n")
+                (append-to-file (point-min) (point-max) file-path))))
         (error
-         (message "Failed to write to file %s: %s" file-path err))))))
+         (message "Elilog: Failed to write to file %s: %s" file-path (error-message-string err)))))))
 
 (defun elilog-sinks--dispose-file (sink)
   "清理文件Sink资源。"
@@ -157,13 +176,17 @@ MAX-LINES: 最大行数，超过时删除旧行"
 ;;; ===== 循环文件Sink =====
 
 (defun elilog-sinks--write-to-rolling-file (event sink)
-  "写入到循环文件。"
+  "Write log event to rolling file, ensuring directory exists.
+写入日志事件到滚动文件，确保目录存在。"
   (let* ((config (elilog-sink-config sink))
          (base-path (plist-get config :base-path))
          (max-size (plist-get config :max-size))
          (max-files (plist-get config :max-files))
          (current-file (or (plist-get (elilog-sink-state sink) :current-file)
                           (concat base-path ".0"))))
+    
+    ;; Ensure directory exists for the base path / 确保基础路径的目录存在
+    (elilog-sinks--ensure-directory-exists current-file)
     
     ;; 检查文件大小
     (when (and (file-exists-p current-file)
@@ -179,9 +202,12 @@ MAX-LINES: 最大行数，超过时删除旧行"
     ;; 写入文件
     (let ((formatted (elilog-formatters-format-event event (elilog-sink-formatter sink))))
       (when formatted
-        (with-temp-buffer
-          (insert formatted "\n")
-          (append-to-file (point-min) (point-max) current-file))))))
+        (condition-case err
+            (with-temp-buffer
+              (insert formatted "\n")
+              (append-to-file (point-min) (point-max) current-file))
+          (error
+           (message "Elilog: Failed to write to rolling file %s: %s" current-file (error-message-string err))))))))
 
 (defun elilog-sinks--roll-files (base-path max-files)
   "滚动文件。"
